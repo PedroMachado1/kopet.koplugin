@@ -5,5 +5,5 @@ return {
     fullname = _("KoPet"),
     description = _("A virtual pet that evolves with your reading habits. Read pages to feed, care for, and evolve your companion."),
     author = "Pedro",
-    version = "1.0.0",
+    version = "2.0.0",
 }

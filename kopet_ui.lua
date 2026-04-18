@@ -23,9 +23,6 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local ButtonTable = require("ui/widget/buttontable")
 local Screen = Device.screen
 
--- ─────────────────────────────────────────────────────────────
--- i18n helper (same lazy-load approach as main.lua)
--- ─────────────────────────────────────────────────────────────
 local _i18n = nil
 local function _load_i18n()
     if _i18n then return _i18n end
@@ -56,60 +53,138 @@ end
 
 local KoPetUI = {}
 
---------------------------------------------------------------------------------
--- Progress Bar (text-based for E-ink compatibility)
---------------------------------------------------------------------------------
-local function make_bar_text(label, value, max_value)
-    local pct = math.floor((value / max_value) * 100 + 0.5)
-    local bar_len = 20
-    local filled = math.floor(bar_len * value / max_value + 0.5)
-    local empty = bar_len - filled
-
-    local bar = string.rep("#", filled) .. string.rep("-", empty)
-    return string.format("%-12s [%s] %d%%", label, bar, pct)
+local function clamp(v, min_v, max_v)
+    if v < min_v then return min_v end
+    if v > max_v then return max_v end
+    return v
 end
 
---------------------------------------------------------------------------------
--- XP Progress Bar
---------------------------------------------------------------------------------
-local function make_xp_bar(xp_progress, xp_needed, level)
-    local pct = 0
-    if xp_needed > 0 then
-        pct = math.floor((xp_progress / xp_needed) * 100 + 0.5)
-    end
-    local bar_len = 20
-    local filled = 0
-    if xp_needed > 0 then
-        filled = math.floor(bar_len * xp_progress / xp_needed + 0.5)
-    end
-    local empty = bar_len - filled
-    local bar = string.rep("#", filled) .. string.rep("-", empty)
-    return string.format("%-12s [%s] %d%%", T("Level") .. " " .. level, bar, pct)
+local function shorten(text, max_len)
+    if not text then return "" end
+    if #text <= max_len then return text end
+    return text:sub(1, max_len - 3) .. "..."
 end
 
---------------------------------------------------------------------------------
--- Full Panel Widget
---------------------------------------------------------------------------------
+local function resolve_panel_mode(mode, screen_w, screen_h)
+    if mode and mode ~= "auto" then
+        return mode
+    end
+    if screen_w < 700 or screen_h < 900 then
+        return "compact"
+    end
+    if screen_w > 1100 and screen_h > 1400 then
+        return "detailed"
+    end
+    return "normal"
+end
+
+local function add_divider(vgroup, width)
+    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
+    table.insert(vgroup, LineWidget:new{
+        dimen = Geom:new{ w = width, h = 1 },
+        background = Blitbuffer.COLOR_DARK_GRAY,
+    })
+    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
+end
+
+local function make_meter(label, value, max_value, width)
+    local maxv = math.max(1, max_value or 1)
+    local cur = clamp(value or 0, 0, maxv)
+    local pct = math.floor((cur / maxv) * 100 + 0.5)
+    local fill = math.floor(width * cur / maxv + 0.5)
+    local empty = width - fill
+    return string.format("%-4s [%s%s] %3d%%", label, string.rep("#", fill), string.rep("-", empty), pct)
+end
+
+local function add_text_line(vgroup, text, face, width)
+    table.insert(vgroup, TextBoxWidget:new{
+        text = text,
+        face = face,
+        width = width,
+        alignment = "center",
+    })
+end
+
+local function shift_lines_horiz(lines, spaces)
+    local out = {}
+    local pad = ""
+    if spaces > 0 then
+        pad = string.rep(" ", spaces)
+    end
+    for i, line in ipairs(lines or {}) do
+        if spaces > 0 then
+            out[i] = pad .. line
+        elseif spaces < 0 then
+            local cut = math.min(#line, -spaces)
+            out[i] = string.sub(line, cut + 1)
+        else
+            out[i] = line
+        end
+    end
+    return out
+end
+
+local function build_animated_sprite_text(sprite_lines, tick)
+    local phase = tick % 4
+    if phase == 1 then
+        return table.concat(shift_lines_horiz(sprite_lines, 1), "\n")
+    elseif phase == 2 then
+        return table.concat(shift_lines_horiz(sprite_lines, 2), "\n")
+    elseif phase == 3 then
+        return table.concat(shift_lines_horiz(sprite_lines, 1), "\n")
+    end
+    return table.concat(sprite_lines, "\n")
+end
+
 function KoPetUI.createPanel(stats, sprite_lines, stage_name, callbacks)
     local screen_w = Screen:getWidth()
     local screen_h = Screen:getHeight()
+    local mode = resolve_panel_mode(callbacks.mode, screen_w, screen_h)
 
-    local face_normal = Font:getFace("cfont", 16)
-    local face_sprite = Font:getFace("cfont", 18)
-    local face_small = Font:getFace("cfont", 14)
-    local face_title = Font:getFace("cfont", 22)
 
-    local pet_name = stats.pet_name or "KoPet"
+    local normal_size = 16
+    local sprite_size = 18
+    local small_size = 14
+    local title_size = 24
+    local meter_width = 16
+    local content_width = screen_w - 40
+    local sprite_box_width = content_width - 20
+    local section_gap = 6
+
+    if mode == "compact" then
+        normal_size = 14
+        sprite_size = 15
+        small_size = 12
+        title_size = 20
+        meter_width = 12
+        content_width = screen_w - 26
+        sprite_box_width = content_width - 14
+        section_gap = 4
+    elseif mode == "detailed" then
+        normal_size = 18
+        sprite_size = 20
+        small_size = 15
+        title_size = 26
+        meter_width = 18
+        content_width = screen_w - 52
+        sprite_box_width = content_width - 24
+        section_gap = 8
+    end
+
+    local face_normal = Font:getFace("infont", normal_size)
+    local face_sprite = Font:getFace("infont", sprite_size)
+    local face_small = Font:getFace("smallinfont", small_size)
+    local face_title = Font:getFace("cfont", title_size)
+
+    local pet_name = shorten(stats.pet_name or "KoPet", 18)
     local vgroup = VerticalGroup:new{ align = "center" }
 
-    -- ═══════════════════════════════════════════
-    -- Title
-    -- ═══════════════════════════════════════════
-    local title_text
-    if stats.is_sick then
-        title_text = pet_name .. " - " .. T("Sick")
+    local title_text = pet_name
+    local subtitle_text
+    if stats.is_deep_sleep then
+        subtitle_text = T("Deep Sleep...")
     else
-        title_text = string.format("%s - %s (%s)", pet_name, stage_name, TF("Lv.%d", stats.level))
+        subtitle_text = string.format("%s  -  %s", stage_name, TF("Lv.%d", stats.level))
     end
 
     table.insert(vgroup, TextWidget:new{
@@ -117,34 +192,35 @@ function KoPetUI.createPanel(stats, sprite_lines, stage_name, callbacks)
         face = face_title,
         bold = true,
     })
+    add_text_line(vgroup, subtitle_text, face_small, content_width)
+    table.insert(vgroup, VerticalSpan:new{ width = section_gap })
+    add_divider(vgroup, content_width)
+    table.insert(vgroup, VerticalSpan:new{ width = section_gap })
 
-    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
-
-    -- ═══════════════════════════════════════════
-    -- Separator
-    -- ═══════════════════════════════════════════
-    table.insert(vgroup, LineWidget:new{
-        dimen = Geom:new{ w = screen_w - 40, h = 2 },
-        background = Blitbuffer.COLOR_BLACK,
-    })
-    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
-
-    -- ═══════════════════════════════════════════
-    -- Pet Sprite
-    -- ═══════════════════════════════════════════
+    local animate_pet = callbacks.animate_pet == true and not stats.is_sick and not stats.is_deep_sleep
+    local animation_interval = callbacks.animation_interval or 1.6
+    local animation_tick = 0
     local sprite_text = table.concat(sprite_lines, "\n")
-    table.insert(vgroup, TextBoxWidget:new{
+    if animate_pet then
+        sprite_text = build_animated_sprite_text(sprite_lines, animation_tick)
+    end
+
+    local sprite_text_widget = TextBoxWidget:new{
         text = sprite_text,
         face = face_sprite,
-        width = screen_w - 60,
+        width = sprite_box_width,
         alignment = "center",
-    })
+    }
 
-    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
+    local sprite_box = FrameContainer:new{
+        bordersize = 1,
+        padding = Size.padding.default,
+        background = Blitbuffer.COLOR_WHITE,
+        sprite_text_widget,
+    }
+    table.insert(vgroup, sprite_box)
+    table.insert(vgroup, VerticalSpan:new{ width = section_gap })
 
-    -- ═══════════════════════════════════════════
-    -- Mood indicator
-    -- ═══════════════════════════════════════════
     local mood_labels = {
         happy = T("Happy"),
         idle = T("Normal"),
@@ -153,84 +229,47 @@ function KoPetUI.createPanel(stats, sprite_lines, stage_name, callbacks)
         eating = T("Eating"),
         sick = T("Sick"),
     }
-    local mood_text = TF("Mood: %s", mood_labels[stats.mood] or stats.mood)
-    table.insert(vgroup, TextWidget:new{
-        text = mood_text,
-        face = face_normal,
-    })
-
-    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
-
-    -- ═══════════════════════════════════════════
-    -- Status Bars
-    -- ═══════════════════════════════════════════
-    table.insert(vgroup, LineWidget:new{
-        dimen = Geom:new{ w = screen_w - 40, h = 1 },
-        background = Blitbuffer.COLOR_DARK_GRAY,
-    })
-    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
-
-    local bars = {
-        make_bar_text(T("Hunger"), stats.hunger, 100),
-        make_bar_text(T("Happiness"), stats.happiness, 100),
-        make_bar_text(T("Energy"), stats.energy, 100),
-        make_xp_bar(stats.xp_progress, stats.xp_needed, stats.level),
-    }
-
-    for _, bar in ipairs(bars) do
-        table.insert(vgroup, TextWidget:new{
-            text = bar,
-            face = face_small,
-        })
-        table.insert(vgroup, VerticalSpan:new{ width = 2 })
+    add_text_line(vgroup, TF("Mood: %s", mood_labels[stats.mood] or stats.mood), face_normal, content_width)
+    if stats.is_bored or stats.is_sleepy or stats.is_sick then
+        local badges = {}
+        if stats.is_sick then table.insert(badges, T("SICK")) end
+        if stats.is_bored then table.insert(badges, T("BORED")) end
+        if stats.is_sleepy then table.insert(badges, T("SLEEPY")) end
+        add_text_line(vgroup, table.concat(badges, "  |  "), face_small, content_width)
     end
+    table.insert(vgroup, VerticalSpan:new{ width = section_gap })
 
-    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
+    add_text_line(vgroup, make_meter(T("Hunger"), stats.hunger, 100, meter_width), face_small, content_width)
+    table.insert(vgroup, VerticalSpan:new{ width = 2 })
+    add_text_line(vgroup, make_meter(T("Happiness"), stats.happiness, 100, meter_width), face_small, content_width)
+    table.insert(vgroup, VerticalSpan:new{ width = 2 })
+    add_text_line(vgroup, make_meter(T("Energy"), stats.energy, 100, meter_width), face_small, content_width)
+    table.insert(vgroup, VerticalSpan:new{ width = 2 })
+    add_text_line(vgroup, make_meter("XP", stats.xp_progress, stats.xp_needed, meter_width), face_small, content_width)
 
-    -- ═══════════════════════════════════════════
-    -- Inventory
-    -- ═══════════════════════════════════════════
-    table.insert(vgroup, LineWidget:new{
-        dimen = Geom:new{ w = screen_w - 40, h = 1 },
-        background = Blitbuffer.COLOR_DARK_GRAY,
-    })
-    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
+    table.insert(vgroup, VerticalSpan:new{ width = section_gap })
+    add_divider(vgroup, content_width)
+    table.insert(vgroup, VerticalSpan:new{ width = section_gap })
 
     local inv_text = TF("Food: %d  |  Treats: %d  |  Medicine: %d  |  Cryst: %d",
         stats.food, stats.treats, stats.medicines or 0, stats.crystals)
-    table.insert(vgroup, TextWidget:new{
-        text = inv_text,
-        face = face_normal,
-    })
+    add_text_line(vgroup, inv_text, face_normal, content_width)
 
-    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
+    table.insert(vgroup, VerticalSpan:new{ width = section_gap })
+    add_text_line(vgroup,
+        TF("Pages: %d  |  Books: %d  |  Streak: %d d  |  Age: %d d", stats.total_pages, stats.books_completed, stats.streak_days, stats.age_days),
+        face_small,
+        content_width)
 
-    -- ═══════════════════════════════════════════
-    -- Reading Stats
-    -- ═══════════════════════════════════════════
-    local stats_text = TF("Pages: %d  |  Books: %d  |  Streak: %d d  |  Age: %d d",
-        stats.total_pages, stats.books_completed, stats.streak_days, stats.age_days)
-    table.insert(vgroup, TextWidget:new{
-        text = stats_text,
-        face = face_small,
-    })
+    table.insert(vgroup, VerticalSpan:new{ width = section_gap })
 
-    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
+    local next_level = math.max(0, (stats.xp_needed or 0) - (stats.xp_progress or 0))
+    add_text_line(vgroup, TF("Total XP: %d  |  Next level: %d XP", stats.xp, next_level), face_small, content_width)
 
-    -- XP detail
-    local xp_detail = TF("Total XP: %d  |  Next level: %d XP", stats.xp, stats.xp_needed - stats.xp_progress)
-    table.insert(vgroup, TextWidget:new{
-        text = xp_detail,
-        face = face_small,
-    })
+    table.insert(vgroup, VerticalSpan:new{ width = section_gap })
 
-    table.insert(vgroup, VerticalSpan:new{ width = Size.span.vertical_default })
-
-    -- ═══════════════════════════════════════════
-    -- Action Buttons
-    -- ═══════════════════════════════════════════
     local button_table = ButtonTable:new{
-        width = screen_w - 40,
+        width = content_width,
         buttons = {
             {
                 {
@@ -261,11 +300,9 @@ function KoPetUI.createPanel(stats, sprite_lines, stage_name, callbacks)
         },
         show_parent = callbacks.show_parent,
     }
+
     table.insert(vgroup, button_table)
 
-    -- ═══════════════════════════════════════════
-    -- Build final container
-    -- ═══════════════════════════════════════════
     local content = CenterContainer:new{
         dimen = Geom:new{ w = screen_w, h = screen_h },
         vgroup,
@@ -285,7 +322,18 @@ function KoPetUI.createPanel(stats, sprite_lines, stage_name, callbacks)
         frame,
     }
 
-    -- Close on back gesture / key
+    if animate_pet then
+        widget._kopet_anim_running = true
+        widget._kopet_anim_action = function()
+            if not widget._kopet_anim_running then return end
+            animation_tick = animation_tick + 1
+            sprite_text_widget:setText(build_animated_sprite_text(sprite_lines, animation_tick))
+            UIManager:setDirty(widget, "ui", widget.dimen)
+            UIManager:scheduleIn(animation_interval, widget._kopet_anim_action)
+        end
+        UIManager:scheduleIn(animation_interval, widget._kopet_anim_action)
+    end
+
     if Device:hasKeys() then
         widget.key_events = {
             Close = { { "Back" }, doc = "close KoPet panel" },
@@ -308,8 +356,11 @@ function KoPetUI.createPanel(stats, sprite_lines, stage_name, callbacks)
     end
 
     function widget:onClose()
+        self._kopet_anim_running = false
+        if self._kopet_anim_action then
+            UIManager:unschedule(self._kopet_anim_action)
+        end
         UIManager:close(self)
-        -- Force full screen refresh on E-ink
         UIManager:setDirty(nil, function()
             return "full", Device.screen:getSize()
         end)

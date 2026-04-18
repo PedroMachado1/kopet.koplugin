@@ -14,6 +14,7 @@
 local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local Dispatcher = require("dispatcher")
 local logger = require("logger")
 local _ = require("gettext")
 
@@ -66,6 +67,91 @@ local function TF(key, ...)
     return string.format(key, ...)
 end
 
+local function copy_table(tbl)
+    local out = {}
+    for k, v in pairs(tbl or {}) do
+        if type(v) == "table" then
+            out[k] = copy_table(v)
+        else
+            out[k] = v
+        end
+    end
+    return out
+end
+
+local function merge_missing(dst, defaults)
+    for k, v in pairs(defaults or {}) do
+        if dst[k] == nil then
+            if type(v) == "table" then
+                dst[k] = copy_table(v)
+            else
+                dst[k] = v
+            end
+        elseif type(v) == "table" and type(dst[k]) == "table" then
+            merge_missing(dst[k], v)
+        end
+    end
+end
+
+local function append_events(target, src)
+    if not src then return end
+    for _, e in ipairs(src) do
+        table.insert(target, e)
+    end
+end
+
+local function panel_mode_label(mode)
+    if mode == "compact" then return T("Compact") end
+    if mode == "normal" then return T("Normal") end
+    if mode == "detailed" then return T("Detailed") end
+    return T("Auto")
+end
+
+local function notifications_label(mode)
+    if mode == "quiet" then return T("Quiet") end
+    if mode == "verbose" then return T("Verbose") end
+    return T("Normal")
+end
+
+local function animation_label(enabled)
+    return enabled and T("On") or T("Off")
+end
+
+local function cycle_value(current, ordered)
+    local idx = 1
+    for i, v in ipairs(ordered) do
+        if v == current then
+            idx = i
+            break
+        end
+    end
+    return ordered[(idx % #ordered) + 1]
+end
+
+local function difficulty_label(key)
+    local displays = {
+        easy = T("Easy (3-7 pgs)"),
+        normal = T("Normal (10-15 pgs)"),
+        hard = T("Hard (20-30 pgs)"),
+    }
+    return displays[key or "normal"] or displays.normal
+end
+
+local function show_journal(self)
+    local entries = {}
+    if self._state.journal and #self._state.journal > 0 then
+        for i = #self._state.journal, 1, -1 do
+            local e = self._state.journal[i]
+            table.insert(entries, os.date("%Y-%m-%d: ", e.date) .. e.text)
+        end
+    else
+        table.insert(entries, T("No journal entries yet."))
+    end
+    UIManager:show(InfoMessage:new{
+        text = table.concat(entries, "\n\n"),
+    })
+end
+
 -- ─────────────────────────────────────────────────────────────
 -- Settings persistence helpers
 -- ─────────────────────────────────────────────────────────────
@@ -77,33 +163,61 @@ local function get_default_state()
         return Logic.get_default_state()
     end
     return {
+        state_version = 2,
         hunger = 80, happiness = 60, energy = 100, xp = 0,
-        food = 3, treats = 0, crystals = 0,
+        food = 3, treats = 0, crystals = 0, medicines = 0,
         total_pages = 0, session_pages = 0, books_completed = 0,
         streak_days = 0, last_read_date = nil, today_pages = 0,
         last_hunger_tick = os.time(), last_happiness_tick = os.time(),
-        last_petting_time = 0, last_offline_time = os.time(),
-        starving_since = nil, is_deep_sleep = false,
+        last_petting_time = 0, last_offline_time = os.time(), last_page_time = os.time(),
+        starving_since = nil, is_deep_sleep = false, is_sick = false, pages_sick = 0,
         pages_per_food = 10, book_milestones = {},
         completed_books = {}, pet_name = "KoPet", created_at = os.time(),
+        accessories = {}, equipped_accessory = nil,
+        difficulty = "normal",
+        evolution_path = "normal",
+        reading_habits = {
+            night_pages = 0,
+            day_pages = 0,
+            total_read_time = 0,
+            read_pages_count = 0,
+        },
+        journal = {},
+        config = {
+            panel_mode = "detailed",
+            notifications = "normal",
+            routine_notify_cooldown = 30,
+            pet_animation = true,
+            pet_animation_interval = 1.6,
+        },
     }
 end
 
 local function load_state()
+    local defaults = get_default_state()
+    local state = {}
+
     local G = G_reader_settings
     if G and G:has(SAVE_KEY) then
         local saved = G:readSetting(SAVE_KEY)
         if saved and type(saved) == "table" then
-            local defaults = get_default_state()
-            for k, v in pairs(defaults) do
-                if saved[k] == nil then
-                    saved[k] = v
-                end
-            end
-            return saved
+            state = saved
         end
     end
-    return get_default_state()
+
+    merge_missing(state, defaults)
+
+    local Migrations = load_local("kopet_migrations")
+    if Migrations then
+        state = Migrations.migrate(state, defaults)
+    end
+
+    local Config = load_local("kopet_config")
+    if Config then
+        state.config = Config.merge(state.config)
+    end
+
+    return state
 end
 
 local function save_state(state)
@@ -126,43 +240,64 @@ local function notify(msg, duration)
     end)
 end
 
--- Translate an event message (the message is an English key/template)
-local function translate_message(msg)
-    local i18n = load_local("kopet_i18n")
-    if not i18n then return msg end
+local function render_event_message(event)
+    if not event then return "" end
 
-    -- Try direct lookup first
-    local translated = i18n.T(msg)
-    if translated ~= msg then return translated end
+    local key = event.key or event.message or ""
+    local payload = event.payload or {}
 
-    -- For messages with embedded values like "Level 5!", extract the template
-    -- Match patterns: "Level %d!" etc.
-    local patterns = {
-        { pattern = "^Level (%d+)!$", key = "Level %d!" },
-        { pattern = "^Food %+1! %(Total: (%d+)%)$", key = "Food +1! (Total: %d)" },
-        { pattern = "^Rare Treat! %((%d+)%% of book%)$", key = "Rare Treat! (%d%% of book)" },
-        { pattern = "^Streak lost! %((%d+) days%)$", key = "Streak lost! (%d days)" },
-        { pattern = "^Streak: (%d+) days!$", key = "Streak: %d days!" },
-        { pattern = "^Fed! Hunger: (%d+)%%$", key = "Fed! Hunger: %d%%" },
-        { pattern = "^Petted! Happiness: (%d+)%%$", key = "Petted! Happiness: %d%%" },
-        { pattern = "^Wait (%d+) min to pet again%.$", key = "Wait %d min to pet again." },
-        { pattern = "^Your pet is hungry! %((%d+)%%%)$", key = "Your pet is hungry! (%d%%)" },
-        { pattern = "^Treat given! Hunger: (%d+)%% | Happiness: (%d+)%%$", key = "Treat given! Hunger: %d%% | Happiness: %d%%" },
-    }
-
-    for _, p in ipairs(patterns) do
-        local captures = { msg:match(p.pattern) }
-        if #captures > 0 then
-            local tmpl = i18n.T(p.key)
-            local nums = {}
-            for _, c in ipairs(captures) do
-                table.insert(nums, tonumber(c))
-            end
-            return string.format(tmpl, unpack(nums))
-        end
+    if key == "event.level_up" then
+        return TF("Level %d!", payload.level or event.level or 0)
+    elseif key == "event.food_earned" then
+        return TF("Food +1! (Total: %d)", payload.total_food or 0)
+    elseif key == "event.treat_earned" then
+        return TF("Rare Treat! (%d%% of book)", payload.milestone or 0)
+    elseif key == "event.streak_lost" then
+        return TF("Streak lost! (%d days)", payload.days or 0)
+    elseif key == "event.streak" then
+        return TF("Streak: %d days!", payload.days or 0)
+    elseif key == "event.fed" then
+        return TF("Fed! Hunger: %d%%", payload.hunger or 0)
+    elseif key == "event.treat_used" then
+        return TF("Treat given! Hunger: %d%% | Happiness: %d%%", payload.hunger or 0, payload.happiness or 0)
+    elseif key == "event.cooldown" then
+        return TF("Wait %d min to pet again.", payload.mins or 0)
+    elseif key == "event.petted" then
+        return TF("Petted! Happiness: %d%%", payload.happiness or 0)
+    elseif key == "event.hungry_warning" then
+        return TF("Your pet is hungry! (%d%%)", payload.hunger or 0)
+    elseif key == "event.medicine_found" then
+        return T("Found Medicine!")
+    elseif key == "event.no_medicine" then
+        return T("No medicine! Keep reading while sick to find some.")
+    elseif key == "event.cured" then
+        return T("Cured! Your pet is healthy again.")
+    elseif key == "event.not_sick" then
+        return T("Your pet is healthy! No need for medicine.")
+    elseif key == "event.is_sick" then
+        return T("Your pet is sick and cannot eat. Needs Medicine!")
+    elseif key == "event.became_sick" then
+        return T("Your pet became sick from starvation!")
+    elseif key == "event.pet_sick" then
+        return T("Your pet is sick...")
+    elseif key == "event.accessory_found" then
+        return TF("Found accessory: %s", tostring(payload.accessory or "?"))
+    elseif key == "event.bored" then
+        return T("Your pet looks bored. Give it some attention.")
+    elseif key == "event.sleepy" then
+        return T("Your pet is sleepy. Let it rest a bit.")
+    elseif key == "event.rested" then
+        return T("Your pet feels rested again.")
     end
 
-    return msg
+    local translated = T(key)
+    if translated ~= key then
+        return translated
+    end
+    if event.message then
+        return event.message
+    end
+    return tostring(key)
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -185,13 +320,20 @@ local KoPet = WidgetContainer:extend{
 -- Init
 -- ─────────────────────────────────────────────────────────────
 function KoPet:init()
+    self:onDispatcherRegisterActions()
+
     self._state = load_state()
+    self._notify_cooldown = (self._state.config and self._state.config.routine_notify_cooldown) or self._notify_cooldown
     self._suppress_notifications = true
 
     local Logic = load_local("kopet_logic")
     if Logic then
+        local all_events = {}
         local events
         self._state, events = Logic.update_time_decay(self._state)
+        append_events(all_events, events)
+
+        self:_process_events(all_events)
         save_state(self._state)
     end
 
@@ -211,6 +353,19 @@ function KoPet:init()
     self:_schedule_decay()
 end
 
+function KoPet:onDispatcherRegisterActions()
+    Dispatcher:registerAction("kopet_show_panel", {
+        category = "none",
+        event = "KoPetShowPanel",
+        title = _("KoPet: View Pet"),
+        general = true,
+    })
+end
+
+function KoPet:onKoPetShowPanel()
+    self:_show_panel()
+end
+
 -- ─────────────────────────────────────────────────────────────
 -- Menu
 -- ─────────────────────────────────────────────────────────────
@@ -223,151 +378,254 @@ function KoPet:addToMainMenu(menu_items)
                 text_func = function() return T("View Pet") end,
                 keep_menu_open = false,
                 callback = function()
+                    self._state.last_quick_action = "view_pet"
+                    save_state(self._state)
                     self:_show_panel()
                 end,
             },
             {
-                text_func = function() return T("Feed") end,
-                keep_menu_open = true,
-                callback = function()
-                    self:_action_feed()
-                end,
-            },
-            {
-                text_func = function() return T("Pet") end,
-                keep_menu_open = true,
-                callback = function()
-                    self:_action_pet()
-                end,
-            },
-            {
-                text_func = function() return T("Give Treat") end,
-                keep_menu_open = true,
-                callback = function()
-                    self:_action_treat()
-                end,
-            },
-            {
-                text_func = function() return T("Give Medicine") end,
-                keep_menu_open = true,
-                callback = function()
-                    self:_action_medicine()
-                end,
-            },
-            {
-                text_func = function() return T("Journal") end,
+                text_func = function() return T("Quick Action") end,
                 keep_menu_open = false,
                 callback = function()
-                    local entries = {}
-                    if self._state.journal and #self._state.journal > 0 then
-                        for i = #self._state.journal, 1, -1 do
-                            local e = self._state.journal[i]
-                            table.insert(entries, os.date("%Y-%m-%d: ", e.date) .. e.text)
-                        end
+                    local action = self._state.last_quick_action or "view_pet"
+                    if action == "feed" then
+                        self:_action_feed()
+                    elseif action == "pet" then
+                        self:_action_pet()
+                    elseif action == "treat" then
+                        self:_action_treat()
+                    elseif action == "medicine" then
+                        self:_action_medicine()
+                    elseif action == "stats" then
+                        self:_show_stats()
+                    elseif action == "journal" then
+                        show_journal(self)
                     else
-                        table.insert(entries, T("No journal entries yet."))
+                        self:_show_panel()
                     end
-                    local InfoMessage = require("ui/widget/infomessage")
-                    UIManager:show(InfoMessage:new{
-                        text = table.concat(entries, "\n\n"),
-                    })
                 end,
             },
             {
-                text_func = function() return T("Accessories") end,
-                sub_item_table_func = function()
-                    local items = {}
-                    if not self._state.accessories or #self._state.accessories == 0 then
-                        table.insert(items, {
-                            text_func = function() return T("No accessories found yet.") end,
-                            callback = function() end,
-                        })
-                        return items
-                    end
-
-                    -- Unequip option
-                    table.insert(items, {
-                        text_func = function() return T("Unequip Accessory") end,
-                        checked_func = function() return self._state.equipped_accessory == nil end,
-                        callback = function()
-                            self._state.equipped_accessory = nil
-                            save_state(self._state)
-                            notify(T("Unequipped"))
-                        end,
-                    })
-
-                    -- Equip options
-                    for _, acc in ipairs(self._state.accessories) do
-                        table.insert(items, {
-                            text_func = function() return acc end,
-                            checked_func = function() return self._state.equipped_accessory == acc end,
-                            callback = function()
-                                self._state.equipped_accessory = acc
-                                save_state(self._state)
-                                notify(TF("Equipped: %s", acc))
-                            end,
-                        })
-                    end
-                    return items
-                end,
-            },
-            {
-                text_func = function() return T("Statistics") end,
-                keep_menu_open = true,
-                callback = function()
-                    self:_show_stats()
-                end,
-            },
-            {
-                text_func = function()
-                    local d = self._state.difficulty or "normal"
-                    local displays = { easy = T("Easy (3-7 pgs)"), normal = T("Normal (10-15 pgs)"), hard = T("Hard (20-30 pgs)") }
-                    return TF("Difficulty: %s", displays[d] or displays.normal)
-                end,
+                text_func = function() return T("Care") end,
                 sub_item_table = {
                     {
-                        text_func = function() return T("Easy (3-7 pgs)") end,
-                        checked_func = function() return self._state.difficulty == "easy" end,
+                        text_func = function() return T("Feed") end,
+                        keep_menu_open = true,
                         callback = function()
-                            self._state.difficulty = "easy"
+                            self._state.last_quick_action = "feed"
                             save_state(self._state)
-                            notify(TF("Set to: %s", T("Easy (3-7 pgs)")))
+                            self:_action_feed()
                         end,
                     },
                     {
-                        text_func = function() return T("Normal (10-15 pgs)") end,
-                        checked_func = function() return (self._state.difficulty or "normal") == "normal" end,
+                        text_func = function() return T("Pet") end,
+                        keep_menu_open = true,
                         callback = function()
-                            self._state.difficulty = "normal"
+                            self._state.last_quick_action = "pet"
                             save_state(self._state)
-                            notify(TF("Set to: %s", T("Normal (10-15 pgs)")))
+                            self:_action_pet()
                         end,
                     },
                     {
-                        text_func = function() return T("Hard (20-30 pgs)") end,
-                        checked_func = function() return self._state.difficulty == "hard" end,
+                        text_func = function() return T("Give Treat") end,
+                        keep_menu_open = true,
                         callback = function()
-                            self._state.difficulty = "hard"
+                            self._state.last_quick_action = "treat"
                             save_state(self._state)
-                            notify(TF("Set to: %s", T("Hard (20-30 pgs)")))
+                            self:_action_treat()
+                        end,
+                    },
+                    {
+                        text_func = function() return T("Give Medicine") end,
+                        keep_menu_open = true,
+                        callback = function()
+                            self._state.last_quick_action = "medicine"
+                            save_state(self._state)
+                            self:_action_medicine()
                         end,
                     },
                 },
             },
-
             {
-                text_func = function() return T("Rename Pet") end,
-                keep_menu_open = true,
-                callback = function()
-                    self:_rename_pet()
-                end,
+                text_func = function() return T("Pet Info") end,
+                sub_item_table = {
+                    {
+                        text_func = function() return T("Today Summary") end,
+                        keep_menu_open = false,
+                        callback = function()
+                            self:_show_daily_summary()
+                        end,
+                    },
+                    {
+                        text_func = function() return T("Statistics") end,
+                        keep_menu_open = true,
+                        callback = function()
+                            self._state.last_quick_action = "stats"
+                            save_state(self._state)
+                            self:_show_stats()
+                        end,
+                    },
+                    {
+                        text_func = function() return T("Journal") end,
+                        keep_menu_open = false,
+                        callback = function()
+                            self._state.last_quick_action = "journal"
+                            save_state(self._state)
+                            show_journal(self)
+                        end,
+                    },
+                    {
+                        text_func = function() return T("Accessories") end,
+                        keep_menu_open = true,
+                        sub_item_table_func = function()
+                            local items = {}
+                            if not self._state.accessories or #self._state.accessories == 0 then
+                                table.insert(items, {
+                                    text_func = function() return T("No accessories found yet.") end,
+                                    callback = function() end,
+                                })
+                                return items
+                            end
+
+                            table.insert(items, {
+                                text_func = function() return T("Unequip Accessory") end,
+                                checked_func = function() return self._state.equipped_accessory == nil end,
+                                callback = function()
+                                    self._state.equipped_accessory = nil
+                                    save_state(self._state)
+                                end,
+                            })
+
+                            for _, acc in ipairs(self._state.accessories) do
+                                table.insert(items, {
+                                    text_func = function() return acc end,
+                                    checked_func = function() return self._state.equipped_accessory == acc end,
+                                    callback = function()
+                                        self._state.equipped_accessory = acc
+                                        save_state(self._state)
+                                    end,
+                                })
+                            end
+                            return items
+                        end,
+                    },
+                    {
+                        text_func = function() return T("Rename Pet") end,
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_rename_pet()
+                        end,
+                    },
+                },
             },
             {
-                text_func = function() return T("Reset Pet") end,
-                keep_menu_open = true,
-                callback = function()
-                    self:_confirm_reset()
-                end,
+                text_func = function() return T("Settings") end,
+                sub_item_table = {
+                    {
+                        text_func = function()
+                            local d = self._state.difficulty or "normal"
+                            return TF("Difficulty: %s", difficulty_label(d))
+                        end,
+                        sub_item_table = {
+                            {
+                                text_func = function() return T("Easy (3-7 pgs)") end,
+                                checked_func = function() return self._state.difficulty == "easy" end,
+                                callback = function()
+                                    self._state.difficulty = "easy"
+                                    save_state(self._state)
+                                end,
+                            },
+                            {
+                                text_func = function() return T("Normal (10-15 pgs)") end,
+                                checked_func = function() return (self._state.difficulty or "normal") == "normal" end,
+                                callback = function()
+                                    self._state.difficulty = "normal"
+                                    save_state(self._state)
+                                end,
+                            },
+                            {
+                                text_func = function() return T("Hard (20-30 pgs)") end,
+                                checked_func = function() return self._state.difficulty == "hard" end,
+                                callback = function()
+                                    self._state.difficulty = "hard"
+                                    save_state(self._state)
+                                end,
+                            },
+                        },
+                    },
+                    {
+                        text_func = function()
+                            local mode = (self._state.config and self._state.config.panel_mode) or "auto"
+                            return TF("Panel mode: %s", panel_mode_label(mode))
+                        end,
+                        keep_menu_open = true,
+                        callback = function(menu)
+                            if not self._state.config then
+                                self._state.config = {}
+                            end
+                            self._state.config.panel_mode = cycle_value(self._state.config.panel_mode or "auto", {
+                                "auto", "compact", "normal", "detailed",
+                            })
+                            save_state(self._state)
+                            if menu and menu.updateItems then
+                                menu:updateItems()
+                            end
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local mode = (self._state.config and self._state.config.notifications) or "normal"
+                            return TF("Notifications: %s", notifications_label(mode))
+                        end,
+                        keep_menu_open = true,
+                        callback = function(menu)
+                            if not self._state.config then
+                                self._state.config = {}
+                            end
+                            self._state.config.notifications = cycle_value(self._state.config.notifications or "normal", {
+                                "normal", "quiet", "verbose",
+                            })
+                            save_state(self._state)
+                            if menu and menu.updateItems then
+                                menu:updateItems()
+                            end
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local enabled = true
+                            if self._state.config and self._state.config.pet_animation ~= nil then
+                                enabled = self._state.config.pet_animation
+                            end
+                            return TF("Pet animation: %s", animation_label(enabled))
+                        end,
+                        keep_menu_open = true,
+                        callback = function(menu)
+                            if not self._state.config then
+                                self._state.config = {}
+                            end
+                            local current = self._state.config.pet_animation
+                            if current == nil then current = true end
+                            self._state.config.pet_animation = not current
+                            save_state(self._state)
+                            if menu and menu.updateItems then
+                                menu:updateItems()
+                            end
+                        end,
+                    },
+                },
+            },
+            {
+                text_func = function() return T("Danger Zone") end,
+                sub_item_table = {
+                    {
+                        text_func = function() return T("Reset Pet") end,
+                        keep_menu_open = true,
+                        callback = function()
+                            self:_confirm_reset()
+                        end,
+                    },
+                },
             },
         },
     }
@@ -388,9 +646,7 @@ function KoPet:onPageUpdate(pageno)
 
     local events
     self._state, events = Logic.on_page_read(self._state)
-    if events then
-        for _, e in ipairs(events) do table.insert(all_events, e) end
-    end
+    append_events(all_events, events)
 
     if self.ui and self.ui.document then
         local total = nil
@@ -405,17 +661,13 @@ function KoPet:onPageUpdate(pageno)
                 self.ui.document.file,
                 progress_pct
             )
-            if m_events then
-                for _, e in ipairs(m_events) do table.insert(all_events, e) end
-            end
+            append_events(all_events, m_events)
         end
     end
 
     local s_events
     self._state, s_events = Logic.check_streak(self._state)
-    if s_events then
-        for _, e in ipairs(s_events) do table.insert(all_events, e) end
-    end
+    append_events(all_events, s_events)
 
     if #all_events > 0 then
         self:_process_events_batched(all_events)
@@ -435,9 +687,12 @@ function KoPet:onEndOfBook()
         book_path = self.ui.document.file
     end
 
+    local all_events = {}
     local events
     self._state, events = Logic.on_book_finished(self._state, book_path)
-    self:_process_events(events)
+    append_events(all_events, events)
+
+    self:_process_events(all_events)
     save_state(self._state)
     return false
 end
@@ -456,9 +711,12 @@ end
 function KoPet:onResume()
     local Logic = load_local("kopet_logic")
     if Logic and self._state then
+        local all_events = {}
         local events
         self._state, events = Logic.update_time_decay(self._state)
-        self:_process_events(events)
+        append_events(all_events, events)
+
+        self:_process_events(all_events)
         save_state(self._state)
     end
     self:_schedule_decay()
@@ -488,37 +746,80 @@ end
 function KoPet:_action_feed()
     local Logic = load_local("kopet_logic")
     if not Logic then return end
+
+    self._state.last_quick_action = "feed"
+
+    local all_events = {}
     local events
     self._state, events = Logic.feed(self._state)
-    self:_process_events(events)
-    save_state(self._state)
-end
+    append_events(all_events, events)
 
-function KoPet:_action_medicine()
-    local Logic = load_local("kopet_logic")
-    if not Logic then return end
-    local events
-    self._state, events = Logic.feed_medicine(self._state)
-    self:_process_events(events)
+    self:_process_events(all_events)
     save_state(self._state)
 end
 
 function KoPet:_action_pet()
     local Logic = load_local("kopet_logic")
     if not Logic then return end
+
+    self._state.last_quick_action = "pet"
+
+    local all_events = {}
     local events
     self._state, events = Logic.pet(self._state)
-    self:_process_events(events)
+    append_events(all_events, events)
+
+    self:_process_events(all_events)
     save_state(self._state)
 end
 
 function KoPet:_action_treat()
     local Logic = load_local("kopet_logic")
     if not Logic then return end
+
+    self._state.last_quick_action = "treat"
+
+    local all_events = {}
     local events
     self._state, events = Logic.feed_treat(self._state)
-    self:_process_events(events)
+    append_events(all_events, events)
+
+    self:_process_events(all_events)
     save_state(self._state)
+end
+
+function KoPet:_action_medicine()
+    local Logic = load_local("kopet_logic")
+    if not Logic then return end
+
+    self._state.last_quick_action = "medicine"
+
+    local all_events = {}
+    local events
+    self._state, events = Logic.feed_medicine(self._state)
+    append_events(all_events, events)
+
+    self:_process_events(all_events)
+    save_state(self._state)
+end
+
+function KoPet:_show_daily_summary()
+    local history = self._state.daily_history or {}
+    local today = os.date("%Y-%m-%d")
+    local day = history[today] or { pages = 0, care = 0, books = 0, medicine_found = 0 }
+
+    local lines = {
+        T("Today Summary"),
+        "",
+        TF("Pages read: %d", day.pages or 0),
+        TF("Care actions: %d", day.care or 0),
+        TF("Books completed: %d", day.books or 0),
+        TF("Medicine found: %d", day.medicine_found or 0),
+    }
+
+    UIManager:show(InfoMessage:new{
+        text = table.concat(lines, "\n"),
+    })
 end
 
 -- ─────────────────────────────────────────────────────────────
@@ -541,7 +842,6 @@ function KoPet:_show_panel()
     local stats = Logic.get_stats_summary(self._state)
     local stage = Sprites.get_stage(stats.level, self._state.evolution_path)
     local raw_lines = Sprites.get_sprite(stats.level, stats.mood, self._state.evolution_path)
-
     local sprite_lines = Sprites.apply_compositing(raw_lines, self._state.equipped_accessory)
 
     local panel_ref = nil
@@ -580,6 +880,9 @@ function KoPet:_show_panel()
             end
         end,
         show_parent = self,
+        mode = self._state.config and self._state.config.panel_mode or "auto",
+        animate_pet = self._state.config == nil or self._state.config.pet_animation ~= false,
+        animation_interval = (self._state.config and self._state.config.pet_animation_interval) or 1.6,
     })
 
     panel_ref = panel
@@ -599,7 +902,7 @@ function KoPet:_show_stats()
     end
 
     local stats = Logic.get_stats_summary(self._state)
-    local stage = Sprites.get_stage(stats.level)
+    local stage = Sprites.get_stage(stats.level, self._state.evolution_path)
     local mini = Sprites.get_mini(stats.mood)
     local pet_name = stats.pet_name or "KoPet"
 
@@ -616,7 +919,10 @@ function KoPet:_show_stats()
         "",
         TF("Food: %d", stats.food),
         TF("Treats: %d", stats.treats),
+        TF("Medicine: %d", stats.medicines or 0),
         TF("Crystals: %d", stats.crystals),
+        TF("Accessory: %s", stats.equipped_accessory or T("None")),
+        TF("Difficulty: %s", difficulty_label(stats.difficulty or "normal")),
         "",
         TF("Pages read: %d", stats.total_pages),
         TF("Books completed: %d", stats.books_completed),
@@ -697,6 +1003,11 @@ function KoPet:_process_events(events)
     if self._suppress_notifications then return end
     if not events or #events == 0 then return end
 
+    local Events = load_local("kopet_events")
+    if Events then
+        events = Events.normalize_list(events)
+    end
+
     local Sprites = load_local("kopet_sprites")
     local Logic = load_local("kopet_logic")
     local mini = "(o.o)"
@@ -708,9 +1019,10 @@ function KoPet:_process_events(events)
 
     local event = events[1]
     if event then
-        local msg = prefix .. translate_message(event.message)
+        local msg = prefix .. render_event_message(event)
         if event.type == "level_up" and Sprites then
-            local stage = Sprites.get_stage(event.level)
+            local level = event.level or (event.payload and event.payload.level)
+            local stage = Sprites.get_stage(level or 0)
             msg = msg .. "\n" .. T(stage.name) .. "!"
         end
         notify(msg, 3)
@@ -724,18 +1036,28 @@ function KoPet:_process_events_batched(events)
     if self._suppress_notifications then return end
     if not events or #events == 0 then return end
 
+    local Events = load_local("kopet_events")
+    if Events then
+        events = Events.normalize_list(events)
+    end
+
+    if self._state and self._state.config and self._state.config.notifications == "quiet" then
+        local filtered = {}
+        for _, event in ipairs(events) do
+            if event.priority == "important" then
+                table.insert(filtered, event)
+            end
+        end
+        events = filtered
+        if #events == 0 then return end
+    end
+
     local important = {}
     local routine = {}
-
-    for _, event in ipairs(events) do
-        if event.type == "level_up" or event.type == "treat_earned" or
-           event.type == "crystal_earned" or event.type == "streak" or
-           event.type == "streak_lost" or event.type == "deep_sleep" or
-           event.type == "starving" or event.type == "revived" then
-            table.insert(important, event)
-        else
-            table.insert(routine, event)
-        end
+    if Events and Events.split_by_priority then
+        important, routine = Events.split_by_priority(events)
+    else
+        routine = events
     end
 
     local pet_name = self._state.pet_name or "KoPet"
@@ -750,9 +1072,10 @@ function KoPet:_process_events_batched(events)
 
         local lines = {}
         for _, event in ipairs(important) do
-            local msg = translate_message(event.message)
+            local msg = render_event_message(event)
             if event.type == "level_up" and Sprites then
-                local stage = Sprites.get_stage(event.level)
+                local level = event.level or (event.payload and event.payload.level)
+                local stage = Sprites.get_stage(level or 0)
                 msg = msg .. " " .. T(stage.name) .. "!"
             end
             table.insert(lines, msg)
@@ -763,7 +1086,12 @@ function KoPet:_process_events_batched(events)
     end
 
     local now = os.time()
-    if (now - self._last_notify_time) < self._notify_cooldown then
+    local cooldown = self._notify_cooldown
+    if self._state and self._state.config and self._state.config.notifications == "verbose" then
+        cooldown = math.max(10, math.floor(self._notify_cooldown / 2))
+    end
+
+    if (now - self._last_notify_time) < cooldown then
         return
     end
 
@@ -774,7 +1102,7 @@ function KoPet:_process_events_batched(events)
         if Logic and Sprites then
             mini = Sprites.get_mini(Logic.get_mood(self._state))
         end
-        notify(pet_name .. " " .. mini .. " " .. translate_message(routine[1].message), 2)
+        notify(pet_name .. " " .. mini .. " " .. render_event_message(routine[1]), 2)
         self._last_notify_time = now
     end
 end
@@ -791,9 +1119,12 @@ function KoPet:_schedule_decay()
 
         local Logic = load_local("kopet_logic")
         if Logic and self._state then
+            local all_events = {}
             local events
             self._state, events = Logic.update_time_decay(self._state)
-            self:_process_events(events)
+            append_events(all_events, events)
+
+            self:_process_events(all_events)
             save_state(self._state)
         end
 
